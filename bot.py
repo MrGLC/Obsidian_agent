@@ -197,7 +197,7 @@ from langchain_chroma import Chroma
 from langchain_openai import OpenAIEmbeddings
 
 embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
-OBSIDIAN_VAULT_PATH = "/Users/luisgg/tryingAI"  # Update this path
+OBSIDIAN_VAULT_PATH = os.environ.get("OBSIDIAN_VAULT", "/vault")
 vector_store = Chroma(
     collection_name="obsidian_jarvis",
     embedding_function=embeddings,
@@ -840,51 +840,49 @@ memory = MemorySaver()
 graph = graph_builder.compile(checkpointer=memory)
 
 # Run the graph
-def process_query(user_input):
-    """Process a user query through the graph."""
+def process_query(user_input: str) -> str:
+    """Process a user query through the graph and return the final AI message."""
     config = {
         "configurable": {
             "thread_id": "1",
-            "recursion_limit": 10  # Set a lower recursion limit
+            "recursion_limit": 10,
         }
     }
-    
+
     events = graph.stream(
         {
             "messages": [HumanMessage(content=user_input)],
-            "document_created": False,  # Initialize state
-            "WebResults": [],  # Initialize empty web results
-            "VaultFindings": [],  # Initialize empty vault findings
+            "document_created": False,
+            "WebResults": [],
+            "VaultFindings": [],
         },
         config,
         stream_mode="values",
     )
-    
-    # Process and display events
+
+    final_response = ""
     for event in events:
         if "messages" in event and event["messages"]:
             latest_message = event["messages"][-1]
             print(f"{latest_message.__class__.__name__}: {latest_message.content}")
-            
-            # Check for tool calls and display them
+
+            if isinstance(latest_message, AIMessage):
+                final_response = latest_message.content
+
             if hasattr(latest_message, "tool_calls") and latest_message.tool_calls:
                 for tool_call in latest_message.tool_calls:
                     tool_name = tool_call.get("name", "unknown_tool")
                     tool_args = tool_call.get("args", {})
                     print(f"Tool Call: {tool_name}")
                     print(f"Tool Args: {tool_args}")
-                    
-                    # If it's an update_vault_document call, print additional info
+
                     if tool_name == "update_vault_document":
                         title = tool_args.get("title", "Untitled")
                         print(f"Creating/Updating document: {title}")
-                        
-        # Check for other important state updates
+
         if "updated_file_path" in event:
             print(f"Document updated at: {event['updated_file_path']}")
         if "document_uuid" in event:
             print(f"Document UUID: {event['document_uuid']}")
 
-# Example usage
-if __name__ == "__main__":
-    process_query("me puedes dar una dieta de 1200 calorias?tengo el colon irritado por lo que alimentos especificos que ayuden serian buenos. no hay prisa tienes tiempo pero asegurate de crear las notas adecuadas")
+    return final_response
