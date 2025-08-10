@@ -195,34 +195,41 @@ query_analyzer = query_analyzer_prompt | llm.with_structured_output(
 # Replace this with your actual vector store setup
 from langchain_chroma import Chroma
 from langchain_openai import OpenAIEmbeddings
+from obsidian_vectorstore import delete_note, index_note
 
 embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
-OBSIDIAN_VAULT_PATH = "/Users/luisgg/tryingAI"  # Update this path
+OBSIDIAN_VAULT_PATH = os.environ.get("OBSIDIAN_VAULT", "/vault")
 vector_store = Chroma(
     collection_name="obsidian_jarvis",
     embedding_function=embeddings,
-    persist_directory="./obsidian_jarvis_db",  # Where to save data locally, remove if not necessary
+    persist_directory="./chroma_obsidian_db",
 )
 
 # Define tools
 @tool
 def search_vault(query: str, tool_call_id: Annotated[str, InjectedToolCallId]) -> str:
     """Search the Obsidian vault for information relevant to the query."""
-    # Search vector store
     results = vector_store.similarity_search_with_score(query, k=3)
-    
-    # Format results
-    findings = []
-    for doc, score in results:
-        findings.append(f"* Document: {doc.metadata.get('title', 'Untitled')} (Relevance: {score:.2f})")
-    
-    findings_str = "\n".join(findings) if findings else "No relevant documents found."
-    
-    # Return message and update state with the actual document objects
-    return Command(update={
-        "VaultFindings": [doc for doc, _ in results],
-        "messages": [ToolMessage(f"Found {len(results)} relevant documents in vault:\n{findings_str}", tool_call_id=tool_call_id)]
-    })
+
+    excerpts = []
+    for doc, _ in results:
+        excerpt = doc.page_content[:200].replace("\n", " ")
+        excerpts.append(
+            f"UUID: {doc.metadata.get('uuid', '')}\n{excerpt}"
+        )
+
+    findings_message = (
+        "We have this data available for the user:\n" + "\n---\n".join(excerpts)
+        if excerpts
+        else "No relevant documents found."
+    )
+
+    return Command(
+        update={
+            "VaultFindings": [doc for doc, _ in results],
+            "messages": [ToolMessage(findings_message, tool_call_id=tool_call_id)],
+        }
+    )
 
 
 @tool
@@ -274,44 +281,25 @@ def update_vault_document(
     file_path = os.path.join(OBSIDIAN_VAULT_PATH, f"{filename}.md")
     print(f"  - file_path: {file_path}")
     
-    # Generate a new UUID if none was provided
-    doc_uuid = existing_uuid if existing_uuid else str(uuid.uuid4())
-    
-    # If we have an existing UUID, delete the old document from the vector store
+    # Remove old embeddings if updating an existing document
     if existing_uuid:
         try:
-            vector_store.delete(ids=[existing_uuid])
+            delete_note(vector_store, existing_uuid)
         except Exception as e:
             print(f"Warning: Failed to delete document with UUID {existing_uuid}: {e}")
-    
+
     try:
-        # Write file
         with open(file_path, 'w', encoding='utf-8') as f:
             f.write(content)
         print(f"  - Successfully wrote file to: {file_path}")
-        
-        # Create document directly without using a loader
-        from langchain_core.documents import Document
-        
-        # Create a document with the content and metadata
-        document = Document(
-            page_content=content,
-            metadata={
-                'uuid': doc_uuid,
-                'title': title,
-                'last_modified': datetime.now().isoformat(),
-                'source_path': f"{filename}.md"
-            }
-        )
-        
-        # Add to vector store with explicit ID
-        vector_store.add_documents([document], ids=[doc_uuid])
-        print(f"  - Successfully added document to vector store with UUID: {doc_uuid}")
-        
+
+        doc_uuid = index_note(vector_store, Path(file_path))
+        print(f"  - Successfully indexed document with UUID: {doc_uuid}")
+
         return Command(update={
             "updated_file_path": file_path,
-            "document_uuid": doc_uuid,  # Return the UUID for future reference
-            "messages": [ToolMessage(f"Document '{title}' has been updated in the vault at {file_path}", tool_call_id=tool_call_id)]
+            "document_uuid": doc_uuid,
+            "messages": [ToolMessage(f"Document '{title}' has been updated in the vault at {file_path}", tool_call_id=tool_call_id)],
         })
     except Exception as e:
         error_msg = f"Error in update_vault_document: {str(e)}"
@@ -840,51 +828,49 @@ memory = MemorySaver()
 graph = graph_builder.compile(checkpointer=memory)
 
 # Run the graph
-def process_query(user_input):
-    """Process a user query through the graph."""
+def process_query(user_input: str) -> str:
+    """Process a user query through the graph and return the final AI message."""
     config = {
         "configurable": {
             "thread_id": "1",
-            "recursion_limit": 10  # Set a lower recursion limit
+            "recursion_limit": 10,
         }
     }
-    
+
     events = graph.stream(
         {
             "messages": [HumanMessage(content=user_input)],
-            "document_created": False,  # Initialize state
-            "WebResults": [],  # Initialize empty web results
-            "VaultFindings": [],  # Initialize empty vault findings
+            "document_created": False,
+            "WebResults": [],
+            "VaultFindings": [],
         },
         config,
         stream_mode="values",
     )
-    
-    # Process and display events
+
+    final_response = ""
     for event in events:
         if "messages" in event and event["messages"]:
             latest_message = event["messages"][-1]
             print(f"{latest_message.__class__.__name__}: {latest_message.content}")
-            
-            # Check for tool calls and display them
+
+            if isinstance(latest_message, AIMessage):
+                final_response = latest_message.content
+
             if hasattr(latest_message, "tool_calls") and latest_message.tool_calls:
                 for tool_call in latest_message.tool_calls:
                     tool_name = tool_call.get("name", "unknown_tool")
                     tool_args = tool_call.get("args", {})
                     print(f"Tool Call: {tool_name}")
                     print(f"Tool Args: {tool_args}")
-                    
-                    # If it's an update_vault_document call, print additional info
+
                     if tool_name == "update_vault_document":
                         title = tool_args.get("title", "Untitled")
                         print(f"Creating/Updating document: {title}")
-                        
-        # Check for other important state updates
+
         if "updated_file_path" in event:
             print(f"Document updated at: {event['updated_file_path']}")
         if "document_uuid" in event:
             print(f"Document UUID: {event['document_uuid']}")
 
-# Example usage
-if __name__ == "__main__":
-    process_query("me puedes dar una dieta de 1200 calorias?tengo el colon irritado por lo que alimentos especificos que ayuden serian buenos. no hay prisa tienes tiempo pero asegurate de crear las notas adecuadas")
+    return final_response
