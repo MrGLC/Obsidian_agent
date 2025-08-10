@@ -1,0 +1,24 @@
+version: '3.8'
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.bot
+    ports:
+      - "8001:8001"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OBSIDIAN_VAULT=/vault
+    volumes:
+      - ./vault:/vault
+  mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    ports:
+      - "8000:8000"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OBSIDIAN_VAULT=/vault
+    volumes:
+      - ./vault:/vault
